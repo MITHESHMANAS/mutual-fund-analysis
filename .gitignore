@@ -1,0 +1,6 @@
+*.db
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+backup_old_files/

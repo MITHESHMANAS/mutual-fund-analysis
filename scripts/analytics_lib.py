@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-BASE = Path(__file__).parent
+BASE = Path(__file__).resolve().parent.parent
 DATA = BASE / "data"
 
 
@@ -32,9 +32,15 @@ def load_portfolio_holdings():
     return pd.read_csv(DATA / "processed/09_portfolio_holdings_clean.csv")
 
 
+def load_investor_profile():
+    """Loads investor demographic profile (SYNTHETIC)."""
+    return pd.read_csv(DATA / "raw/investor_profile_SYNTHETIC.csv")
+
+
 def load_transactions():
-    """Loads the SYNTHETIC investor transactions dataset."""
-    df = pd.read_csv(DATA / "raw/08_investor_transactions_SYNTHETIC.csv",
+    """Loads the cleaned (ETL-processed) investor transactions dataset.
+    Source is SYNTHETIC -- see scripts/generate_synthetic_transactions.py."""
+    df = pd.read_csv(DATA / "processed/investor_transactions_clean.csv",
                       parse_dates=["transaction_date"])
     return df
 
@@ -168,8 +174,104 @@ def compute_sip_continuity(txns: pd.DataFrame, min_sips: int = 6,
 
 
 # ---------------------------------------------------------------------
-# Task 5: Fund recommender
+# Performance metrics (CAGR / Sharpe / Sortino / Alpha-Beta / MDD / Scorecard)
 # ---------------------------------------------------------------------
+def compute_cagr(nav_series: pd.Series, n_trading_days: int) -> float:
+    """
+    CAGR annualized by TRADING days (252/yr), not calendar days -- avoids
+    the common mistake of using calendar-day offsets, which misstates
+    annualized return whenever there are gaps (weekends/holidays).
+    """
+    if len(nav_series) < 2 or n_trading_days <= 0:
+        return np.nan
+    start, end = nav_series.iloc[0], nav_series.iloc[-1]
+    years = n_trading_days / 252
+    if years <= 0 or start <= 0:
+        return np.nan
+    return (end / start) ** (1 / years) - 1
+
+
+def compute_performance_metrics(nav: pd.DataFrame, benchmark: pd.DataFrame,
+                                 benchmark_name_filter: str = "100",
+                                 risk_free_annual: float = 0.065) -> pd.DataFrame:
+    """
+    Computes, per fund (amfi_code):
+      - CAGR 1yr/3yr/5yr (trading-day annualized, using the trailing N*252
+        trading days of NAV history actually available for that fund)
+      - Sharpe & Sortino ratio (annualized, using a real risk-free rate)
+      - Max drawdown (%, peak-to-trough on the NAV series)
+      - Alpha & Beta vs. a benchmark index (OLS regression of daily fund
+        return on daily benchmark return; alpha annualized by *252)
+    """
+    from scipy.stats import linregress
+
+    nav = nav.sort_values(["amfi_code", "date"]).copy()
+    nav["daily_return"] = nav.groupby("amfi_code")["nav"].pct_change()
+
+    bench = benchmark[benchmark["index_name"].str.contains(benchmark_name_filter, case=False, na=False)].copy()
+    bench = bench.sort_values("date")
+    bench["bench_return"] = bench["close_value"].pct_change()
+
+    rf_daily = risk_free_annual / 252
+    rows = []
+    for code, g in nav.groupby("amfi_code"):
+        g = g.reset_index(drop=True)
+        r = g["daily_return"].dropna()
+        if len(r) < 2:
+            continue
+
+        cagr_1yr = compute_cagr(g["nav"].tail(252), min(len(g) - 1, 252))
+        cagr_3yr = compute_cagr(g["nav"].tail(3 * 252), min(len(g) - 1, 3 * 252))
+        cagr_5yr = compute_cagr(g["nav"].tail(5 * 252), min(len(g) - 1, 5 * 252))
+
+        sharpe = ((r.mean() - rf_daily) / r.std()) * np.sqrt(252) if r.std() > 0 else np.nan
+        downside = r[r < 0]
+        sortino = ((r.mean() - rf_daily) / downside.std()) * np.sqrt(252) if len(downside) > 1 and downside.std() > 0 else np.nan
+
+        running_max = g["nav"].cummax()
+        drawdown = (g["nav"] / running_max) - 1
+        max_dd = drawdown.min() * 100
+
+        merged = g[["date", "daily_return"]].merge(bench[["date", "bench_return"]], on="date").dropna()
+        if len(merged) >= 30:
+            beta, alpha_daily, r_value, p_value, se = linregress(merged["bench_return"], merged["daily_return"])
+            alpha_annual = alpha_daily * 252
+        else:
+            beta, alpha_annual = np.nan, np.nan
+
+        rows.append({
+            "amfi_code": code,
+            "cagr_1yr_pct": cagr_1yr * 100 if pd.notna(cagr_1yr) else np.nan,
+            "cagr_3yr_pct": cagr_3yr * 100 if pd.notna(cagr_3yr) else np.nan,
+            "cagr_5yr_pct": cagr_5yr * 100 if pd.notna(cagr_5yr) else np.nan,
+            "sharpe_ratio": sharpe,
+            "sortino_ratio": sortino,
+            "max_drawdown_pct": max_dd,
+            "alpha_annual_pct": alpha_annual * 100 if pd.notna(alpha_annual) else np.nan,
+            "beta": beta,
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_fund_scorecard(perf_metrics: pd.DataFrame, fund_master: pd.DataFrame) -> pd.DataFrame:
+    """
+    Composite Fund Scorecard (0-100): percentile-ranks each metric, then
+    combines with fixed weights:
+      30% 3yr CAGR + 25% Sharpe + 20% Alpha + 15% (inverse) Expense Ratio + 10% (inverse) Max Drawdown
+    """
+    result = fund_master.merge(perf_metrics, on="amfi_code", how="left")
+
+    result["return_rank"] = result["cagr_3yr_pct"].rank(pct=True)
+    result["sharpe_rank"] = result["sharpe_ratio"].rank(pct=True)
+    result["alpha_rank"] = result["alpha_annual_pct"].rank(pct=True)
+    result["expense_rank"] = 1 - result["expense_ratio_pct"].rank(pct=True)
+    result["dd_rank"] = result["max_drawdown_pct"].rank(pct=True)  # less negative = higher percentile = better
+
+    result["fund_score"] = 100 * (
+        0.30 * result["return_rank"] + 0.25 * result["sharpe_rank"] + 0.20 * result["alpha_rank"]
+        + 0.15 * result["expense_rank"] + 0.10 * result["dd_rank"]
+    )
+    return result.sort_values("fund_score", ascending=False).reset_index(drop=True)
 RISK_APPETITE_MAP = {
     "Low": ["Low"],
     "Moderate": ["Moderate", "Moderately High"],
