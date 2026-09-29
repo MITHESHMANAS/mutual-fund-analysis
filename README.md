@@ -179,5 +179,3 @@ The repository includes:
 - Automated Email Reports
 
 ---
-
-Bluestock Fintech Capstone Project
